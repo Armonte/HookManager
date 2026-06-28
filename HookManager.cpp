@@ -1,6 +1,10 @@
-﻿#include "HookManager.hpp"
+// HookManager.cpp — PovertyCaster fork of WistfulHopes/HookManager.
+// The non-template methods below are unchanged from upstream (both GetHook and
+// GetMidHook were already correct here); the dispatcher bug was in the header.
+#include "HookManager.hpp"
 
 HookManager* HookManager::Instance = nullptr;
+uintptr_t HookManager::Temp = 0;
 
 void HookManager::StaticInitialize()
 {
@@ -10,6 +14,7 @@ void HookManager::StaticInitialize()
 void HookManager::StaticFinalize()
 {
     delete Instance;
+    Instance = nullptr;
 }
 
 HookManager* HookManager::GetInstance()
@@ -22,7 +27,8 @@ void* HookManager::GetHook(const uintptr_t HookAddr) const
 {
     for (auto& Hook : Hooks)
     {
-        // there is no size difference between ManagedHook templates, so assume void with no args
+        // No size/layout difference between ManagedHook templates (Addr is first member),
+        // so reinterpret as the void specialization purely to read GetAddr().
         if (static_cast<ManagedHook<&Temp, void>*>(Hook.get())->GetAddr() == HookAddr)
         {
             return Hook.get();
@@ -35,7 +41,6 @@ void* HookManager::GetMidHook(const uintptr_t HookAddr) const
 {
     for (auto& MidHook : MidHooks)
     {
-        // there is no size difference between ManagedMidHook templates, so assume void with no args
         if (static_cast<ManagedMidHook<&Temp>*>(MidHook.get())->GetAddr() == HookAddr)
         {
             return MidHook.get();
