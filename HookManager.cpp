@@ -29,7 +29,7 @@ void* HookManager::GetHook(const uintptr_t HookAddr) const
     {
         // No size/layout difference between ManagedHook templates (Addr is first member),
         // so reinterpret as the void specialization purely to read GetAddr().
-        if (static_cast<ManagedHook<&Temp, void>*>(Hook.get())->GetAddr() == HookAddr)
+        if (static_cast<ManagedHook<&Temp, CallConv::Cdecl, void>*>(Hook.get())->GetAddr() == HookAddr)
         {
             return Hook.get();
         }

@@ -10,9 +10,18 @@
 //    #2  Mid-hook dispatcher looked up GetHook() (wrong vector) -> GetMidHook().
 //    #3  ManagedMidHook::RemoveCallback did push_back instead of erase.
 //    #4  Post-callbacks now receive the REAL current return value, not a zeroed T.
-//    #5  (TODO, see UPSTREAM.md) calling-convention selector for x86 inline detours
-//        (__thiscall/__stdcall/__fastcall). MidHooks are convention-free and cover
-//        the majority of MBAACC hook sites in the meantime.
+//    #5  x86 calling-convention selector for full-function inline detours.
+//        ManagedHook now carries a `CallConv` (Cdecl default / Stdcall / Thiscall /
+//        Fastcall): the Execute thunk is emitted with the matching attribute and the
+//        original is invoked via SafetyHook's unsafe_{call,stdcall,thiscall,fastcall}.
+//        This lets COM/vtable methods (D3D9 Present/Reset/EndScene/DrawPrimitive) and
+//        non-__cdecl game functions be first-class inline hooks with the full pre/post
+//        + return-value chain, not just convention-free mid-hooks.
+//          AddHook<&addr, T, Args...>()        -> __cdecl   (unchanged; backward compatible)
+//          AddHookCC<&addr, CC, T, Args...>()  -> CC-selected
+//        Only the CC-matched Execute thunk is instantiated (member templates + `if
+//        constexpr`), so a __thiscall/__fastcall thunk is never emitted for a hook whose
+//        argument list can't carry the register args.
 //
 //  Verified: builds under i686-w64-mingw32-g++ (GCC 13) -std=c++23, runs as PE32 x86.
 // ============================================================================
@@ -25,7 +34,10 @@
 #include <stdexcept>
 #include <algorithm>
 
-template <uintptr_t* HookAddr, typename T, typename... Args>
+// [PC-fork #5] Calling convention of the hooked function's ABI (x86).
+enum class CallConv { Cdecl, Stdcall, Thiscall, Fastcall };
+
+template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
 class ManagedHook;
 
 template<uintptr_t* HookAddr>
@@ -53,13 +65,26 @@ public:
 
     static HookManager* GetInstance();
 
+    // __cdecl inline hook (backward compatible: existing AddHook<&addr, T, Args...>()).
     template <uintptr_t* HookAddr, typename T, typename... Args>
-    ManagedHook<HookAddr, T, Args...>* AddHook()
+    ManagedHook<HookAddr, CallConv::Cdecl, T, Args...>* AddHook()
     {
         if (void* ExistingHook = GetHook(*HookAddr))
-            return static_cast<ManagedHook<HookAddr, T, Args...>*>(ExistingHook);
+            return static_cast<ManagedHook<HookAddr, CallConv::Cdecl, T, Args...>*>(ExistingHook);
 
-        auto Hook = new ManagedHook<HookAddr, T, Args...>;
+        auto Hook = new ManagedHook<HookAddr, CallConv::Cdecl, T, Args...>;
+        Hooks.push_back(std::shared_ptr<void>(Hook));
+        return Hook;
+    }
+
+    // [PC-fork #5] Convention-selected inline hook (COM/vtable + non-__cdecl functions).
+    template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
+    ManagedHook<HookAddr, CC, T, Args...>* AddHookCC()
+    {
+        if (void* ExistingHook = GetHook(*HookAddr))
+            return static_cast<ManagedHook<HookAddr, CC, T, Args...>*>(ExistingHook);
+
+        auto Hook = new ManagedHook<HookAddr, CC, T, Args...>;
         Hooks.push_back(std::shared_ptr<void>(Hook));
         return Hook;
     }
@@ -82,40 +107,31 @@ ManagedMidHook<HookAddr>* HookManager::AddMidHook()
     return Hook;
 }
 
-template <uintptr_t* HookAddr, typename T, typename... Args>
+// ---------------------------------------------------------------------------
+//  ManagedHook — non-void return
+// ---------------------------------------------------------------------------
+template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
 class ManagedHook
 {
 private:
     friend class HookManager;
 
-    uintptr_t Addr{};
+    uintptr_t Addr{};   // MUST remain the first member — GetHook() reads it via a reinterpret.
     SafetyHookInline Hook;
     std::vector<bool(*)(T&, Args...)> PreCallbacks;
     std::vector<bool(*)(T&, Args...)> PostCallbacks;
 
     uintptr_t GetAddr() const { return Addr; }
 
-    ManagedHook()
+    // Convention-agnostic body: pre-chain -> original (via the CC-matched trampoline) -> post-chain.
+    static T ExecuteImpl(Args... InArgs)
     {
-        Addr = *HookAddr;
-        Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), reinterpret_cast<uintptr_t>(&Execute));
-    }
+        auto Self = static_cast<ManagedHook*>(HookManager::GetInstance()->GetHook(*HookAddr));
+        if (Self == nullptr) throw std::runtime_error("Hook not found! This should never happen.");
 
-public:
-    void AddPreCallback(bool (*Callback)(T&, Args...))  { PreCallbacks.push_back(Callback); }
-    void RemovePreCallback(bool (*Callback)(T&, Args...))  { std::erase(PreCallbacks, Callback); }
-    void AddPostCallback(bool (*Callback)(T&, Args...)) { PostCallbacks.push_back(Callback); }
-    void RemovePostCallback(bool (*Callback)(T&, Args...)) { std::erase(PostCallbacks, Callback); }
-
-    static T Execute(Args... InArgs)
-    {
         T ReturnValue = T();
-
-        auto Hook = static_cast<ManagedHook*>(HookManager::GetInstance()->GetHook(*HookAddr));
-        if (Hook == nullptr) throw std::runtime_error("Hook not found! This should never happen.");
-
         bool bSkipOriginal = false;
-        for (auto& PreCallback : Hook->PreCallbacks)
+        for (auto& PreCallback : Self->PreCallbacks)
         {
             T Temp = T();
             if (PreCallback(Temp, InArgs...))
@@ -127,12 +143,19 @@ public:
         if (!bSkipOriginal)
         {
             // [PC-fork #1] dependent template member call: GCC/Clang require `.template`.
-            ReturnValue = Hook->Hook.template unsafe_call<T>(InArgs...);
+            // [PC-fork #5] call the original with its real ABI so the stack stays balanced.
+            if constexpr (CC == CallConv::Stdcall)
+                ReturnValue = Self->Hook.template unsafe_stdcall<T>(InArgs...);
+            else if constexpr (CC == CallConv::Thiscall)
+                ReturnValue = Self->Hook.template unsafe_thiscall<T>(InArgs...);
+            else if constexpr (CC == CallConv::Fastcall)
+                ReturnValue = Self->Hook.template unsafe_fastcall<T>(InArgs...);
+            else
+                ReturnValue = Self->Hook.template unsafe_call<T>(InArgs...);
         }
-        for (auto& PostCallback : Hook->PostCallbacks)
+        for (auto& PostCallback : Self->PostCallbacks)
         {
-            // [PC-fork #4] post-callbacks see the REAL current return value (upstream
-            // handed them a fresh zero-initialized T, hiding the original/prior result).
+            // [PC-fork #4] post-callbacks see the REAL current return value.
             T Candidate = ReturnValue;
             if (PostCallback(Candidate, InArgs...))
             {
@@ -141,10 +164,41 @@ public:
         }
         return ReturnValue;
     }
+
+    // [PC-fork #5] One attributed entry thunk per convention. Member templates so only the
+    // CC-matched thunk is ODR-used/instantiated (a __thiscall/__fastcall thunk is never
+    // emitted for an argument list that can't carry its register args).
+    template <bool = true> static T __cdecl             Execute_cdecl(Args... a)    { return ExecuteImpl(a...); }
+    template <bool = true> static T SAFETYHOOK_STDCALL  Execute_stdcall(Args... a)  { return ExecuteImpl(a...); }
+    template <bool = true> static T SAFETYHOOK_THISCALL Execute_thiscall(Args... a) { return ExecuteImpl(a...); }
+    template <bool = true> static T SAFETYHOOK_FASTCALL Execute_fastcall(Args... a) { return ExecuteImpl(a...); }
+
+    static void* EntryThunk()
+    {
+        if constexpr (CC == CallConv::Stdcall)       return reinterpret_cast<void*>(&Execute_stdcall<>);
+        else if constexpr (CC == CallConv::Thiscall) return reinterpret_cast<void*>(&Execute_thiscall<>);
+        else if constexpr (CC == CallConv::Fastcall) return reinterpret_cast<void*>(&Execute_fastcall<>);
+        else                                         return reinterpret_cast<void*>(&Execute_cdecl<>);
+    }
+
+    ManagedHook()
+    {
+        Addr = *HookAddr;
+        Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), EntryThunk());
+    }
+
+public:
+    void AddPreCallback(bool (*Callback)(T&, Args...))  { PreCallbacks.push_back(Callback); }
+    void RemovePreCallback(bool (*Callback)(T&, Args...))  { std::erase(PreCallbacks, Callback); }
+    void AddPostCallback(bool (*Callback)(T&, Args...)) { PostCallbacks.push_back(Callback); }
+    void RemovePostCallback(bool (*Callback)(T&, Args...)) { std::erase(PostCallbacks, Callback); }
 };
 
-template <uintptr_t* HookAddr, typename... Args>
-class ManagedHook<HookAddr, void, Args...>
+// ---------------------------------------------------------------------------
+//  ManagedHook — void return
+// ---------------------------------------------------------------------------
+template <uintptr_t* HookAddr, CallConv CC, typename... Args>
+class ManagedHook<HookAddr, CC, void, Args...>
 {
 private:
     friend class HookManager;
@@ -156,10 +210,46 @@ private:
 
     uintptr_t GetAddr() const { return Addr; }
 
+    static void ExecuteImpl(Args... InArgs)
+    {
+        auto Self = static_cast<ManagedHook*>(HookManager::GetInstance()->GetHook(*HookAddr));
+        if (Self == nullptr) throw std::runtime_error("Hook not found! This should never happen.");
+
+        bool bSkipOriginal = false;
+        for (auto& PreCallback : Self->PreCallbacks)
+        {
+            if (PreCallback(InArgs...)) bSkipOriginal = true;
+        }
+        if (!bSkipOriginal)
+        {
+            if constexpr (CC == CallConv::Stdcall)       Self->Hook.unsafe_stdcall(InArgs...);
+            else if constexpr (CC == CallConv::Thiscall) Self->Hook.unsafe_thiscall(InArgs...);
+            else if constexpr (CC == CallConv::Fastcall) Self->Hook.unsafe_fastcall(InArgs...);
+            else                                         Self->Hook.unsafe_call(InArgs...);
+        }
+        for (auto& PostCallback : Self->PostCallbacks)
+        {
+            PostCallback(InArgs...);
+        }
+    }
+
+    template <bool = true> static void __cdecl             Execute_cdecl(Args... a)    { ExecuteImpl(a...); }
+    template <bool = true> static void SAFETYHOOK_STDCALL  Execute_stdcall(Args... a)  { ExecuteImpl(a...); }
+    template <bool = true> static void SAFETYHOOK_THISCALL Execute_thiscall(Args... a) { ExecuteImpl(a...); }
+    template <bool = true> static void SAFETYHOOK_FASTCALL Execute_fastcall(Args... a) { ExecuteImpl(a...); }
+
+    static void* EntryThunk()
+    {
+        if constexpr (CC == CallConv::Stdcall)       return reinterpret_cast<void*>(&Execute_stdcall<>);
+        else if constexpr (CC == CallConv::Thiscall) return reinterpret_cast<void*>(&Execute_thiscall<>);
+        else if constexpr (CC == CallConv::Fastcall) return reinterpret_cast<void*>(&Execute_fastcall<>);
+        else                                         return reinterpret_cast<void*>(&Execute_cdecl<>);
+    }
+
     ManagedHook()
     {
         Addr = *HookAddr;
-        Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), reinterpret_cast<uintptr_t>(&Execute));
+        Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), EntryThunk());
     }
 
 public:
@@ -167,28 +257,11 @@ public:
     void RemovePreCallback(bool (*Callback)(Args...))  { std::erase(PreCallbacks, Callback); }
     void AddPostCallback(bool (*Callback)(Args...)) { PostCallbacks.push_back(Callback); }
     void RemovePostCallback(bool (*Callback)(Args...)) { std::erase(PostCallbacks, Callback); }
-
-    static void Execute(Args... InArgs)
-    {
-        auto Hook = static_cast<ManagedHook*>(HookManager::GetInstance()->GetHook(*HookAddr));
-        if (Hook == nullptr) throw std::runtime_error("Hook not found! This should never happen.");
-
-        bool bSkipOriginal = false;
-        for (auto& PreCallback : Hook->PreCallbacks)
-        {
-            if (PreCallback(InArgs...)) bSkipOriginal = true;
-        }
-        if (!bSkipOriginal)
-        {
-            Hook->Hook.unsafe_call(InArgs...);
-        }
-        for (auto& PostCallback : Hook->PostCallbacks)
-        {
-            PostCallback(InArgs...);
-        }
-    }
 };
 
+// ---------------------------------------------------------------------------
+//  ManagedMidHook (convention-free; unchanged)
+// ---------------------------------------------------------------------------
 template <uintptr_t* HookAddr>
 class ManagedMidHook
 {

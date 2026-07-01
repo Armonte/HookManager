@@ -37,20 +37,26 @@ impossible. Changed to pass the current `ReturnValue` (`T Candidate = ReturnValu
 the "return true to overwrite" semantics. Verified: a post-callback now reads the genuine
 original result.
 
-## #5 — Calling-convention selector for x86 inline detours  *(design work, NOT yet done)*
-On x86, `ManagedHook`'s detour `static T Execute(Args...)` is `__cdecl`, and
-`unsafe_call<T>` uses SafetyHook's default convention. Real target functions are frequently
-`__thiscall` (this in `ecx`), `__stdcall` (callee cleans stack), or `__fastcall`. A plain
-cdecl detour cannot even represent a `this`-in-`ecx` argument, so inline `ManagedHook` is
-currently usable on x86 only for `__cdecl` targets. SafetyHook already exposes
-`unsafe_thiscall` / `unsafe_stdcall` / `unsafe_fastcall`; the fork work is to (a) carry a
-convention tag (template NTTP or tag type) on `ManagedHook`, (b) emit `Execute` with the
-matching `__attribute__((stdcall/fastcall/thiscall))` on x86, and (c) dispatch to the
-matching `unsafe_*call`. On x64 this collapses to a no-op (one convention).
+## #5 — Calling-convention selector for x86 inline detours  *(DONE, upstreamable)*
+`ManagedHook` now carries a `CallConv` non-type template param (`Cdecl` default / `Stdcall`
+/ `Thiscall` / `Fastcall`). The detour `Execute` is emitted with the matching x86 attribute,
+and the original is invoked via SafetyHook's matching `unsafe_{call,stdcall,thiscall,fastcall}`
+(selected with `if constexpr`). The four attributed thunks are member templates, so only the
+CC-matched one is ODR-used/instantiated — a `__thiscall`/`__fastcall` thunk is never emitted
+for an argument list that can't carry its register args.
 
-**Mitigation:** `ManagedMidHook` is convention-free (it only reads `SafetyHookContext`), so
-the bulk of MBAACC's hook sites use mid-hooks and need none of #5. #5 is only required where
-we must wrap a full non-cdecl function with typed args + return control.
+API: `AddHook<&slot, T, Args...>()` stays `__cdecl` (backward compatible; existing hooks and
+the cdecl smoke test are unchanged). `AddHookCC<&slot, CC, T, Args...>()` selects a
+convention. This makes COM/vtable methods (D3D9 `Present`/`Reset`/`EndScene`/`DrawPrimitive`)
+and non-`__cdecl` game functions first-class inline hooks with the full pre/post + return
+chain — no longer limited to convention-free mid-hooks. On x64 the selector collapses to one
+convention (no-op).
+
+**Validated** (`tests/hook_smoke/`, all green under i686-w64-mingw32-g++ GCC 13, PE32 x86):
+`test_inline.cpp` (cdecl), `test_inline_stdcall.cpp` (stdcall: pre/post chain, correct callee
+cleanup, balanced stack across repeated calls), `test_inline_conv.cpp` (thiscall + fastcall —
+`__thiscall` on a free function compiles + runs). `ManagedMidHook` remains for convention-free
+context hooks. **Ready to upstream to WistfulHopes/HookManager.**
 
 ## Misc robustness
 - Added the out-of-line definition `uintptr_t HookManager::Temp = 0;` (upstream relied on it
