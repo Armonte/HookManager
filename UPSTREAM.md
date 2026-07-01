@@ -68,3 +68,17 @@ context hooks. **Ready to upstream to WistfulHopes/HookManager.**
 `i686-w64-mingw32-g++ (GCC 13) -std=c++23 -static`, linked against the vendored SafetyHook
 amalgam (`deps/safetyhook`). Produces `PE32 Intel 80386`. Smoke test (`tests/hook_smoke`):
 inline cdecl pre/post chain ✅, mid-hook chain ✅, all on x86 under WSL interop.
+
+## #6 — ManagedDriverHook: driver/owned inline hook  *(DONE, upstreamable)*
+`ManagedHook` is an *observer* (pre/post callbacks; the original runs exactly once). Some hooks are
+*drivers*: the detour must decide whether/how-many-times the original runs — rollback re-simulation
+(run the frame N times), runahead, fast-forward/turbo, frameskip, replay scrubbing. `ManagedDriverHook`
+models that: `SetDriver(fn)` registers the single detour body, and inside it the owner calls
+`callOriginal(args...)` 0..N times through the trampoline (with the target's ABI, reusing #5's convention
+thunks). Tracked in its own `DriverHooks` vector (`AddDriverHook`/`GetDriverHook`), parallel to
+`Hooks`/`MidHooks`. This lets the netcode-critical frame hook be HookEngine-managed instead of a raw
+`SafetyHookInline` exception. The driver is singular by nature (only one thing decides frame cadence); a
+per-driven-frame *observer* callback chain can be layered onto the same primitive later without changing
+it. General beyond MBAACC (any frame-driven/rollback/emulator hook wants it). **Validated:**
+`tests/hook_smoke/test_driver_hook.cpp` (detour drives the original 3× → sum, repeated, stack sound).
+**Ready to upstream to WistfulHopes/HookManager.**

@@ -48,3 +48,16 @@ void* HookManager::GetMidHook(const uintptr_t HookAddr) const
     }
     return nullptr;
 }
+
+void* HookManager::GetDriverHook(const uintptr_t HookAddr) const
+{
+    for (auto& DriverHook : DriverHooks)
+    {
+        // Addr is the first member of every ManagedDriverHook template, so read it via the void spec.
+        if (static_cast<ManagedDriverHook<&Temp, CallConv::Cdecl, void>*>(DriverHook.get())->GetAddr() == HookAddr)
+        {
+            return DriverHook.get();
+        }
+    }
+    return nullptr;
+}

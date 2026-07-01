@@ -22,6 +22,13 @@
 //        Only the CC-matched Execute thunk is instantiated (member templates + `if
 //        constexpr`), so a __thiscall/__fastcall thunk is never emitted for a hook whose
 //        argument list can't carry the register args.
+//    #6  ManagedDriverHook — a driver/owned inline hook: the detour OWNS the trampoline and drives
+//        the original 0..N times (SetDriver() registers the detour body; callOriginal() runs the
+//        original once, called as many times as the owner wants). This is the rollback-re-sim /
+//        runahead / fast-forward pattern — distinct from ManagedHook (observer pre/post, original
+//        once). Tracked in its own DriverHooks vector (AddDriverHook/GetDriverHook), so the
+//        netcode-critical frame hook is HookEngine-managed with no raw exception. Reuses #5's
+//        attributed thunks. A per-driven-frame observer chain can layer on later unchanged.
 //
 //  Verified: builds under i686-w64-mingw32-g++ (GCC 13) -std=c++23, runs as PE32 x86.
 // ============================================================================
@@ -40,6 +47,10 @@ enum class CallConv { Cdecl, Stdcall, Thiscall, Fastcall };
 template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
 class ManagedHook;
 
+// [PC-fork #6] Driver hook -- the detour OWNS the trampoline and drives the original 0..N times.
+template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
+class ManagedDriverHook;
+
 template<uintptr_t* HookAddr>
 class ManagedMidHook;
 
@@ -55,8 +66,9 @@ private:
 
     ~HookManager() = default;
 
-    std::vector<std::shared_ptr<void>> Hooks{};    // each element is a ManagedHook*
-    std::vector<std::shared_ptr<void>> MidHooks{}; // each element is a ManagedMidHook*
+    std::vector<std::shared_ptr<void>> Hooks{};       // each element is a ManagedHook*
+    std::vector<std::shared_ptr<void>> MidHooks{};    // each element is a ManagedMidHook*
+    std::vector<std::shared_ptr<void>> DriverHooks{}; // [PC-fork #6] each element is a ManagedDriverHook*
     static uintptr_t Temp; // used exclusively for getting hook as templates
 
 public:
@@ -89,12 +101,25 @@ public:
         return Hook;
     }
 
+    // [PC-fork #6] Driver hook: detour OWNS the trampoline, drives the original 0..N times.
+    template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
+    ManagedDriverHook<HookAddr, CC, T, Args...>* AddDriverHook()
+    {
+        if (void* Existing = GetDriverHook(*HookAddr))
+            return static_cast<ManagedDriverHook<HookAddr, CC, T, Args...>*>(Existing);
+
+        auto Hook = new ManagedDriverHook<HookAddr, CC, T, Args...>;
+        DriverHooks.push_back(std::shared_ptr<void>(Hook));
+        return Hook;
+    }
+
     void* GetHook(const uintptr_t HookAddr) const;
 
     template <uintptr_t* HookAddr>
     ManagedMidHook<HookAddr>* AddMidHook();
 
     void* GetMidHook(const uintptr_t HookAddr) const;
+    void* GetDriverHook(const uintptr_t HookAddr) const;
 };
 
 template <uintptr_t* HookAddr>
@@ -257,6 +282,70 @@ public:
     void RemovePreCallback(bool (*Callback)(Args...))  { std::erase(PreCallbacks, Callback); }
     void AddPostCallback(bool (*Callback)(Args...)) { PostCallbacks.push_back(Callback); }
     void RemovePostCallback(bool (*Callback)(Args...)) { std::erase(PostCallbacks, Callback); }
+};
+
+// ---------------------------------------------------------------------------
+//  ManagedDriverHook — [PC-fork #6]
+//  The detour OWNS the trampoline and drives the original 0..N times. The owner registers ONE driver
+//  callback (the detour body) via SetDriver(); inside it, the owner calls callOriginal(args...) as many
+//  times as it wants (rollback re-sim / runahead / fast-forward / skip). Distinct from ManagedHook
+//  (observer pre/post chain, original once). HookEngine-tracked like every other hook, so there is no raw
+//  exception on the netcode-critical frame hook. (A per-driven-frame OBSERVER chain can be layered on
+//  later without changing this primitive; the driver itself is singular by nature.)
+// ---------------------------------------------------------------------------
+template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
+class ManagedDriverHook
+{
+private:
+    friend class HookManager;
+
+    uintptr_t Addr{};   // MUST stay first member — GetDriverHook reads it via a reinterpret.
+    SafetyHookInline Hook;
+    T (*Driver)(Args...) = nullptr;
+
+    uintptr_t GetAddr() const { return Addr; }
+
+    static T ExecuteImpl(Args... InArgs)
+    {
+        auto Self = static_cast<ManagedDriverHook*>(HookManager::GetInstance()->GetDriverHook(*HookAddr));
+        if (Self == nullptr || Self->Driver == nullptr)
+            throw std::runtime_error("DriverHook has no driver set! This should never happen.");
+        return Self->Driver(InArgs...);
+    }
+
+    // [PC-fork #5] attributed entry thunks; only the CC-matched one is instantiated.
+    template <bool = true> static T __cdecl             Execute_cdecl(Args... a)    { return ExecuteImpl(a...); }
+    template <bool = true> static T SAFETYHOOK_STDCALL  Execute_stdcall(Args... a)  { return ExecuteImpl(a...); }
+    template <bool = true> static T SAFETYHOOK_THISCALL Execute_thiscall(Args... a) { return ExecuteImpl(a...); }
+    template <bool = true> static T SAFETYHOOK_FASTCALL Execute_fastcall(Args... a) { return ExecuteImpl(a...); }
+
+    static void* EntryThunk()
+    {
+        if constexpr (CC == CallConv::Stdcall)       return reinterpret_cast<void*>(&Execute_stdcall<>);
+        else if constexpr (CC == CallConv::Thiscall) return reinterpret_cast<void*>(&Execute_thiscall<>);
+        else if constexpr (CC == CallConv::Fastcall) return reinterpret_cast<void*>(&Execute_fastcall<>);
+        else                                         return reinterpret_cast<void*>(&Execute_cdecl<>);
+    }
+
+    ManagedDriverHook()
+    {
+        Addr = *HookAddr;
+        Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), EntryThunk());
+    }
+
+public:
+    // Register the single driver callback (the detour body). It calls callOriginal() as needed.
+    void SetDriver(T (*fn)(Args...)) { Driver = fn; }
+
+    // Run the original ONCE through the trampoline, with the target's ABI. The owner calls this 0..N
+    // times from inside the driver callback (rollback re-sim / runahead / fast-forward / skip).
+    T callOriginal(Args... InArgs)
+    {
+        if constexpr (CC == CallConv::Stdcall)       return Hook.template unsafe_stdcall<T>(InArgs...);
+        else if constexpr (CC == CallConv::Thiscall) return Hook.template unsafe_thiscall<T>(InArgs...);
+        else if constexpr (CC == CallConv::Fastcall) return Hook.template unsafe_fastcall<T>(InArgs...);
+        else                                         return Hook.template unsafe_call<T>(InArgs...);
+    }
 };
 
 // ---------------------------------------------------------------------------
