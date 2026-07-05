@@ -109,7 +109,8 @@ public:
             return static_cast<ManagedDriverHook<HookAddr, CC, T, Args...>*>(Existing);
 
         auto Hook = new ManagedDriverHook<HookAddr, CC, T, Args...>;
-        DriverHooks.push_back(std::shared_ptr<void>(Hook));
+        DriverHooks.push_back(std::shared_ptr<void>(Hook));   // register BEFORE redirecting (ExecuteImpl finds Self)
+        Hook->Install();                                       // NOW redirect the target to our entry thunk
         return Hook;
     }
 
@@ -308,8 +309,15 @@ private:
     static T ExecuteImpl(Args... InArgs)
     {
         auto Self = static_cast<ManagedDriverHook*>(HookManager::GetInstance()->GetDriverHook(*HookAddr));
-        if (Self == nullptr || Self->Driver == nullptr)
-            throw std::runtime_error("DriverHook has no driver set! This should never happen.");
+        // [PC-fork #6 boot-safety] create_inline() redirects the target the instant it runs, so a game frame
+        // can fire before SetDriver() wires the detour body (Driver==null) — or, in principle, before the hook
+        // is even registered (Self==null). Throwing here = std::terminate on the game thread. Instead PASS
+        // THROUGH: run the original frame so the game boots cleanly until the driver is live. (AddDriverHook
+        // now registers BEFORE Install()/create_inline, so Self is non-null; the null branch is last-resort.)
+        if (Self == nullptr)
+            return T{};
+        if (Self->Driver == nullptr)
+            return Self->callOriginal(InArgs...);
         return Self->Driver(InArgs...);
     }
 
@@ -327,9 +335,12 @@ private:
         else                                         return reinterpret_cast<void*>(&Execute_cdecl<>);
     }
 
-    ManagedDriverHook()
+    ManagedDriverHook() { Addr = *HookAddr; }   // registration happens in AddDriverHook BEFORE Install()
+
+    // Redirect the target to our entry thunk. Called by AddDriverHook AFTER this hook is in the manager's
+    // registry, so a frame firing the instant the redirect lands finds Self != null (see ExecuteImpl).
+    void Install()
     {
-        Addr = *HookAddr;
         Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), EntryThunk());
     }
 
