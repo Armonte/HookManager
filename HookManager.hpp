@@ -194,7 +194,7 @@ private:
     // [PC-fork #5] One attributed entry thunk per convention. Member templates so only the
     // CC-matched thunk is ODR-used/instantiated (a __thiscall/__fastcall thunk is never
     // emitted for an argument list that can't carry its register args).
-    template <bool = true> static T __cdecl             Execute_cdecl(Args... a)    { return ExecuteImpl(a...); }
+    template <bool = true> static T SAFETYHOOK_CCALL     Execute_cdecl(Args... a)    { return ExecuteImpl(a...); }
     template <bool = true> static T SAFETYHOOK_STDCALL  Execute_stdcall(Args... a)  { return ExecuteImpl(a...); }
     template <bool = true> static T SAFETYHOOK_THISCALL Execute_thiscall(Args... a) { return ExecuteImpl(a...); }
     template <bool = true> static T SAFETYHOOK_FASTCALL Execute_fastcall(Args... a) { return ExecuteImpl(a...); }
@@ -259,7 +259,7 @@ private:
         }
     }
 
-    template <bool = true> static void __cdecl             Execute_cdecl(Args... a)    { ExecuteImpl(a...); }
+    template <bool = true> static void SAFETYHOOK_CCALL     Execute_cdecl(Args... a)    { ExecuteImpl(a...); }
     template <bool = true> static void SAFETYHOOK_STDCALL  Execute_stdcall(Args... a)  { ExecuteImpl(a...); }
     template <bool = true> static void SAFETYHOOK_THISCALL Execute_thiscall(Args... a) { ExecuteImpl(a...); }
     template <bool = true> static void SAFETYHOOK_FASTCALL Execute_fastcall(Args... a) { ExecuteImpl(a...); }
@@ -322,7 +322,7 @@ private:
     }
 
     // [PC-fork #5] attributed entry thunks; only the CC-matched one is instantiated.
-    template <bool = true> static T __cdecl             Execute_cdecl(Args... a)    { return ExecuteImpl(a...); }
+    template <bool = true> static T SAFETYHOOK_CCALL     Execute_cdecl(Args... a)    { return ExecuteImpl(a...); }
     template <bool = true> static T SAFETYHOOK_STDCALL  Execute_stdcall(Args... a)  { return ExecuteImpl(a...); }
     template <bool = true> static T SAFETYHOOK_THISCALL Execute_thiscall(Args... a) { return ExecuteImpl(a...); }
     template <bool = true> static T SAFETYHOOK_FASTCALL Execute_fastcall(Args... a) { return ExecuteImpl(a...); }
