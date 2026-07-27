@@ -41,6 +41,67 @@
 #include <stdexcept>
 #include <algorithm>
 
+
+// ============================================================================
+//  [PC-fork #7] INSTALL VERIFICATION — a non-null handle is NOT proof a hook installed.
+//
+//  safetyhook::create_inline / create_mid are the EASY API: they swallow every error and return an
+//  EMPTY hook. AddHook*/AddMidHook then return the ManagedHook object regardless, so the universal
+//  `if (h)` check at ~110 call sites across this repo is satisfied whether or not a single byte was
+//  written at the target.
+//
+//  That is not theoretical. A 4-player run hung because ONE instance logged "boot-serialize hook
+//  installed" and "Opening.avi-skip hook installed" and then neither callback ever ran: no lock
+//  acquire, no release, no AVI skip, and the game state stayed pinned on the very word the skip
+//  writes. One silent failure explained all three, and the process looked healthy in its own log for
+//  the entire 115 seconds it took to wedge four peers.
+//
+//  A hook that silently no-ops does not fail loudly, it CHANGES BEHAVIOUR — a missing determinism
+//  no-op, a missing input hijack, a missing frame gate. Each of those presents as a desync or a hang
+//  with no hint that the hook was responsible.
+//
+//  Fix, in two halves:
+//    * use the EXPECTED-returning API (InlineHook::create / MidHook::create) so the real error type is
+//      available instead of a bare empty object, and
+//    * publish failures through a sink the host installs once, so EVERY existing call site becomes
+//      loud with no edit. Call sites may additionally query installed() when they want to branch.
+//  The sink is deliberately a plain function pointer: this header is included at suspended-boot time
+//  from DllMain, where anything with a dynamic initializer or an allocation is a hazard.
+// ============================================================================
+struct HookInstallFailure {
+    uintptr_t   addr;        // the target that was NOT hooked
+    const char* kind;        // "inline" | "mid" | "driver"
+    unsigned    errorType;   // safetyhook Error::type (see HookInstallErrorName)
+};
+
+inline void (*&HookInstallFailureSink())(const HookInstallFailure&) {
+    static void (*sink)(const HookInstallFailure&) = nullptr;
+    return sink;
+}
+
+// Names match safetyhook's InlineHook::Error / MidHook::Error enumerators, in declaration order.
+inline const char* HookInstallErrorName(unsigned t) {
+    static const char* kNames[] = {
+        "BAD_ALLOCATION", "FAILED_TO_DECODE_INSTRUCTION", "SHORT_JUMP_IN_TRAMPOLINE",
+        "IP_RELATIVE_INSTRUCTION_OUT_OF_RANGE", "UNSUPPORTED_INSTRUCTION_IN_TRAMPOLINE",
+        "FAILED_TO_UNPROTECT", "NOT_ENOUGH_SPACE",
+    };
+    return t < (sizeof kNames / sizeof kNames[0]) ? kNames[t] : "UNKNOWN";
+}
+
+inline void ReportHookInstallFailure(uintptr_t addr, const char* kind, unsigned errorType) {
+    if (auto sink = HookInstallFailureSink()) sink(HookInstallFailure{ addr, kind, errorType });
+}
+
+// Create an inline detour and REPORT failure instead of swallowing it. Returns an empty hook on
+// failure exactly as create_inline did, so behaviour is unchanged for callers that ignore it.
+inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char* kind) {
+    auto r = safetyhook::InlineHook::create(target, dest);
+    if (r) return std::move(*r);
+    ReportHookInstallFailure(reinterpret_cast<uintptr_t>(target), kind, r.error().type);
+    return {};
+}
+
 // [PC-fork #5] Calling convention of the hooked function's ABI (x86).
 enum class CallConv { Cdecl, Stdcall, Thiscall, Fastcall };
 
@@ -210,10 +271,13 @@ private:
     ManagedHook()
     {
         Addr = *HookAddr;
-        Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), EntryThunk());
+        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline");
     }
 
 public:
+    // [PC-fork #7] TRUE iff the detour actually took. `this != nullptr` never was evidence of that.
+    bool installed() const { return static_cast<bool>(Hook); }
+
     void AddPreCallback(bool (*Callback)(T&, Args...))  { PreCallbacks.push_back(Callback); }
     void RemovePreCallback(bool (*Callback)(T&, Args...))  { std::erase(PreCallbacks, Callback); }
     void AddPostCallback(bool (*Callback)(T&, Args...)) { PostCallbacks.push_back(Callback); }
@@ -275,10 +339,13 @@ private:
     ManagedHook()
     {
         Addr = *HookAddr;
-        Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), EntryThunk());
+        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline");
     }
 
 public:
+    // [PC-fork #7] TRUE iff the detour actually took. A non-null handle never was evidence of that.
+    bool installed() const { return static_cast<bool>(Hook); }
+
     void AddPreCallback(bool (*Callback)(Args...))  { PreCallbacks.push_back(Callback); }
     void RemovePreCallback(bool (*Callback)(Args...))  { std::erase(PreCallbacks, Callback); }
     void AddPostCallback(bool (*Callback)(Args...)) { PostCallbacks.push_back(Callback); }
@@ -341,10 +408,15 @@ private:
     // registry, so a frame firing the instant the redirect lands finds Self != null (see ExecuteImpl).
     void Install()
     {
-        Hook = safetyhook::create_inline(reinterpret_cast<void*>(*HookAddr), EntryThunk());
+        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline");
     }
 
 public:
+    // [PC-fork #7] TRUE iff the detour actually took. A non-null handle never was evidence of that.
+    // Matters most here: a driver hook that failed to install means the frame is NEVER driven — the
+    // netcode simply does not run, and every symptom points somewhere else.
+    bool installed() const { return static_cast<bool>(Hook); }
+
     // Register the single driver callback (the detour body). It calls callOriginal() as needed.
     void SetDriver(T (*fn)(Args...)) { Driver = fn; }
 
@@ -377,7 +449,8 @@ private:
     ManagedMidHook()
     {
         Addr = *HookAddr;
-        Hook = safetyhook::create_mid(reinterpret_cast<void*>(*HookAddr), [](SafetyHookContext& ctx)
+        // [PC-fork #7] expected-returning create + failure report; see CreateInlineChecked's header note.
+        auto midResult = safetyhook::MidHook::create(reinterpret_cast<void*>(*HookAddr), [](SafetyHookContext& ctx)
         {
             // [PC-fork #2] mid dispatcher must look up the MidHooks vector, not Hooks.
             auto Hook = static_cast<ManagedMidHook*>(HookManager::GetInstance()->GetMidHook(*HookAddr));
@@ -388,9 +461,14 @@ private:
                 Callback(ctx);
             }
         });
+        if (midResult) Hook = std::move(*midResult);
+        else ReportHookInstallFailure(*HookAddr, "mid", midResult.error().type);
     }
 
 public:
+    // [PC-fork #7] TRUE iff the detour actually took. A non-null handle never was evidence of that.
+    bool installed() const { return static_cast<bool>(Hook); }
+
     void AddCallback(void(*Callback)(SafetyHookContext&))    { Callbacks.push_back(Callback); }
     // [PC-fork #3] was push_back (a no-op duplicate); must erase.
     void RemoveCallback(void(*Callback)(SafetyHookContext&)) { std::erase(Callbacks, Callback); }
