@@ -40,6 +40,7 @@
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
+#include <source_location>   // [PC-fork #7b] name the FAILING CALL SITE, not just the failing address
 
 
 // ============================================================================
@@ -68,10 +69,26 @@
 //  The sink is deliberately a plain function pointer: this header is included at suspended-boot time
 //  from DllMain, where anything with a dynamic initializer or an allocation is a hazard.
 // ============================================================================
+// [PC-fork #7b / task #110] The first live run of the sink above produced:
+//     !! HOOK INSTALL FAILED addr=00000000 kind=mid err=FAILED_TO_DECODE_INSTRUCTION
+// on all four peers — a mid-hook pointed at address ZERO, i.e. an address global that was never
+// resolved. That report is true and useless: `addr` is the one field guaranteed to carry no
+// information when the failure is precisely that the address is missing, and nothing else in the
+// line distinguishes one of ~110 call sites from another.
+//
+// So carry the two things that DO identify it:
+//   * `slot` — the address of the uintptr_t global the hook reads its target from. Every call site
+//     names one as a template argument (AddMidHook<&SomeAddr>()), so this resolves to a symbol.
+//   * the call site's file/line/function, via std::source_location defaulted at the FACTORY (not at
+//     the constructor, which would only ever report a line inside this header).
 struct HookInstallFailure {
-    uintptr_t   addr;        // the target that was NOT hooked
+    uintptr_t   addr;        // the target that was NOT hooked (0 == the address global was never set)
     const char* kind;        // "inline" | "mid" | "driver"
     unsigned    errorType;   // safetyhook Error::type (see HookInstallErrorName)
+    const void* slot;        // &the uintptr_t holding `addr` — identifies WHICH hook, even when addr==0
+    const char* file;        // call site
+    unsigned    line;
+    const char* func;
 };
 
 inline void (*&HookInstallFailureSink())(const HookInstallFailure&) {
@@ -89,16 +106,22 @@ inline const char* HookInstallErrorName(unsigned t) {
     return t < (sizeof kNames / sizeof kNames[0]) ? kNames[t] : "UNKNOWN";
 }
 
-inline void ReportHookInstallFailure(uintptr_t addr, const char* kind, unsigned errorType) {
-    if (auto sink = HookInstallFailureSink()) sink(HookInstallFailure{ addr, kind, errorType });
+inline void ReportHookInstallFailure(uintptr_t addr, const char* kind, unsigned errorType,
+                                     const void* slot = nullptr,
+                                     const std::source_location& loc = std::source_location::current()) {
+    if (auto sink = HookInstallFailureSink())
+        sink(HookInstallFailure{ addr, kind, errorType, slot,
+                                 loc.file_name(), loc.line(), loc.function_name() });
 }
 
 // Create an inline detour and REPORT failure instead of swallowing it. Returns an empty hook on
 // failure exactly as create_inline did, so behaviour is unchanged for callers that ignore it.
-inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char* kind) {
+inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char* kind,
+                                            const void* slot = nullptr,
+                                            const std::source_location& loc = std::source_location::current()) {
     auto r = safetyhook::InlineHook::create(target, dest);
     if (r) return std::move(*r);
-    ReportHookInstallFailure(reinterpret_cast<uintptr_t>(target), kind, r.error().type);
+    ReportHookInstallFailure(reinterpret_cast<uintptr_t>(target), kind, r.error().type, slot, loc);
     return {};
 }
 
@@ -138,38 +161,48 @@ public:
 
     static HookManager* GetInstance();
 
+    // [PC-fork #7b] Every factory takes a defaulted std::source_location so a failed install can name
+    // the CALL SITE. It has to be defaulted HERE and not in the constructors: a default argument is
+    // evaluated at the call, so source_location::current() inside a constructor would faithfully report
+    // a line inside this header on every one of the ~110 sites — which is what made the first #110
+    // report unactionable. Costs nothing at runtime on the success path (three pointers, passed and
+    // dropped) and nothing at all in the emitted hook.
+
     // __cdecl inline hook (backward compatible: existing AddHook<&addr, T, Args...>()).
     template <uintptr_t* HookAddr, typename T, typename... Args>
-    ManagedHook<HookAddr, CallConv::Cdecl, T, Args...>* AddHook()
+    ManagedHook<HookAddr, CallConv::Cdecl, T, Args...>* AddHook(
+        const std::source_location& Loc = std::source_location::current())
     {
         if (void* ExistingHook = GetHook(*HookAddr))
             return static_cast<ManagedHook<HookAddr, CallConv::Cdecl, T, Args...>*>(ExistingHook);
 
-        auto Hook = new ManagedHook<HookAddr, CallConv::Cdecl, T, Args...>;
+        auto Hook = new ManagedHook<HookAddr, CallConv::Cdecl, T, Args...>(Loc);
         Hooks.push_back(std::shared_ptr<void>(Hook));
         return Hook;
     }
 
     // [PC-fork #5] Convention-selected inline hook (COM/vtable + non-__cdecl functions).
     template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
-    ManagedHook<HookAddr, CC, T, Args...>* AddHookCC()
+    ManagedHook<HookAddr, CC, T, Args...>* AddHookCC(
+        const std::source_location& Loc = std::source_location::current())
     {
         if (void* ExistingHook = GetHook(*HookAddr))
             return static_cast<ManagedHook<HookAddr, CC, T, Args...>*>(ExistingHook);
 
-        auto Hook = new ManagedHook<HookAddr, CC, T, Args...>;
+        auto Hook = new ManagedHook<HookAddr, CC, T, Args...>(Loc);
         Hooks.push_back(std::shared_ptr<void>(Hook));
         return Hook;
     }
 
     // [PC-fork #6] Driver hook: detour OWNS the trampoline, drives the original 0..N times.
     template <uintptr_t* HookAddr, CallConv CC, typename T, typename... Args>
-    ManagedDriverHook<HookAddr, CC, T, Args...>* AddDriverHook()
+    ManagedDriverHook<HookAddr, CC, T, Args...>* AddDriverHook(
+        const std::source_location& Loc = std::source_location::current())
     {
         if (void* Existing = GetDriverHook(*HookAddr))
             return static_cast<ManagedDriverHook<HookAddr, CC, T, Args...>*>(Existing);
 
-        auto Hook = new ManagedDriverHook<HookAddr, CC, T, Args...>;
+        auto Hook = new ManagedDriverHook<HookAddr, CC, T, Args...>(Loc);
         DriverHooks.push_back(std::shared_ptr<void>(Hook));   // register BEFORE redirecting (ExecuteImpl finds Self)
         Hook->Install();                                       // NOW redirect the target to our entry thunk
         return Hook;
@@ -178,18 +211,18 @@ public:
     void* GetHook(const uintptr_t HookAddr) const;
 
     template <uintptr_t* HookAddr>
-    ManagedMidHook<HookAddr>* AddMidHook();
+    ManagedMidHook<HookAddr>* AddMidHook(const std::source_location& Loc = std::source_location::current());
 
     void* GetMidHook(const uintptr_t HookAddr) const;
     void* GetDriverHook(const uintptr_t HookAddr) const;
 };
 
 template <uintptr_t* HookAddr>
-ManagedMidHook<HookAddr>* HookManager::AddMidHook()
+ManagedMidHook<HookAddr>* HookManager::AddMidHook(const std::source_location& Loc)
 {
     if (void* MidHook = GetMidHook(*HookAddr)) return static_cast<ManagedMidHook<HookAddr>*>(MidHook);
 
-    auto Hook = new ManagedMidHook<HookAddr>;
+    auto Hook = new ManagedMidHook<HookAddr>(Loc);
     MidHooks.push_back(std::shared_ptr<void>(Hook));
     return Hook;
 }
@@ -268,10 +301,11 @@ private:
         else                                         return reinterpret_cast<void*>(&Execute_cdecl<>);
     }
 
-    ManagedHook()
+    explicit ManagedHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
-        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline");
+        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
+                                   HookAddr, Loc);
     }
 
 public:
@@ -336,10 +370,11 @@ private:
         else                                         return reinterpret_cast<void*>(&Execute_cdecl<>);
     }
 
-    ManagedHook()
+    explicit ManagedHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
-        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline");
+        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
+                                   HookAddr, Loc);
     }
 
 public:
@@ -402,13 +437,18 @@ private:
         else                                         return reinterpret_cast<void*>(&Execute_cdecl<>);
     }
 
-    ManagedDriverHook() { Addr = *HookAddr; }   // registration happens in AddDriverHook BEFORE Install()
+    // registration happens in AddDriverHook BEFORE Install(), so the call site has to be STORED here
+    // and used later -- unlike the inline hooks, where the ctor installs directly.
+    std::source_location Loc{};
+    explicit ManagedDriverHook(const std::source_location& L = std::source_location::current())
+        : Loc(L) { Addr = *HookAddr; }
 
     // Redirect the target to our entry thunk. Called by AddDriverHook AFTER this hook is in the manager's
     // registry, so a frame firing the instant the redirect lands finds Self != null (see ExecuteImpl).
     void Install()
     {
-        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline");
+        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
+                                   HookAddr, Loc);
     }
 
 public:
@@ -446,7 +486,7 @@ private:
 
     uintptr_t GetAddr() const { return Addr; }
 
-    ManagedMidHook()
+    explicit ManagedMidHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
         // [PC-fork #7] expected-returning create + failure report; see CreateInlineChecked's header note.
@@ -462,7 +502,7 @@ private:
             }
         });
         if (midResult) Hook = std::move(*midResult);
-        else ReportHookInstallFailure(*HookAddr, "mid", midResult.error().type);
+        else ReportHookInstallFailure(*HookAddr, "mid", midResult.error().type, HookAddr, Loc);
     }
 
 public:
