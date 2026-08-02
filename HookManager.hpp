@@ -40,7 +40,8 @@
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
-#include <source_location>   // [PC-fork #7b] name the FAILING CALL SITE, not just the failing address
+#include <source_location>
+#include <thread>   // [PC-fork #7b] name the FAILING CALL SITE, not just the failing address
 
 
 // ============================================================================
@@ -116,12 +117,46 @@ inline void ReportHookInstallFailure(uintptr_t addr, const char* kind, unsigned 
 
 // Create an inline detour and REPORT failure instead of swallowing it. Returns an empty hook on
 // failure exactly as create_inline did, so behaviour is unchanged for callers that ignore it.
+// [PC-fork #164] RETRY A TRANSIENT ALLOCATION FAILURE.
+//
+// MEASURED 2026-08-01: this install fails intermittently under concurrency — ~2-4% at 24-way parallelism
+// (3/72 and 2/96 across two stress sets, headless, tests/hook_smoke_inline). The error is
+//     ERR=BAD_ALLOCATION
+// i.e. safetyhook could not obtain memory for the TRAMPOLINE. Not a page-protection clash, not an
+// undecodable instruction — both of those were ruled out by measurement (the target's prologue was an
+// ordinary relocatable `sub esp,0x418; push ebx; push ebp`, and the entry bytes were provably untouched).
+//
+// The consequences were real, not cosmetic: qoh99's boot-serialize hook at winMain 0x471810 lost this
+// draw roughly 1 launch in 6, which left that instance's device init unserialized and re-armed the
+// #88/#131 boot-park race the mutex exists to prevent. That instance never opened a window.
+//
+// A retry is correct HERE and only because the error names a transient resource. BAD_ALLOCATION means
+// "no memory right now"; the address space is not full in any lasting sense, and the pressure comes from
+// other processes starting at the same moment. Every OTHER error type is structural — retrying an
+// undecodable instruction or an out-of-range IP-relative operand would loop and still fail — so they
+// short-circuit on the first attempt and report immediately.
+//
+// This belongs in the fork rather than at the ~110 call sites: it is one property of "install an inline
+// hook", every adapter depends on it, and #108 already proved that a per-site convention does not hold.
+// The retry count is REPORTED on final failure so a genuinely exhausted address space still looks
+// different from a one-off contention loss.
 inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char* kind,
                                             const void* slot = nullptr,
                                             const std::source_location& loc = std::source_location::current()) {
-    auto r = safetyhook::InlineHook::create(target, dest);
-    if (r) return std::move(*r);
-    ReportHookInstallFailure(reinterpret_cast<uintptr_t>(target), kind, r.error().type, slot, loc);
+    // 8 attempts with a yield between them. Sized from the measurement, not taste: at a ~3% single-attempt
+    // loss the chance of losing 8 independent draws is ~1e-12, while the cost when the first attempt
+    // succeeds (the overwhelming case) is exactly zero.
+    constexpr int kAttempts = 8;
+    unsigned lastErr = 0;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        auto r = safetyhook::InlineHook::create(target, dest);
+        if (r) return std::move(*r);
+        lastErr = r.error().type;
+        // Structural errors do not improve by waiting — fail fast and report the real reason.
+        if (lastErr != safetyhook::InlineHook::Error::BAD_ALLOCATION) break;
+        std::this_thread::yield();
+    }
+    ReportHookInstallFailure(reinterpret_cast<uintptr_t>(target), kind, lastErr, slot, loc);
     return {};
 }
 
