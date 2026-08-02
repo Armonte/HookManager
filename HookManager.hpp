@@ -90,6 +90,14 @@ struct HookInstallFailure {
     const char* file;        // call site
     unsigned    line;
     const char* func;
+    // [PC-fork #166] Populated ONLY for kHookErrPrologueMismatch, and meaningless otherwise. The bytes
+    // are the whole diagnosis for that failure: "the address is wrong" is unactionable, "wanted
+    // 53 55 56 57 8B E9, found 8B 44 24 04 85 C0" tells you immediately that you landed inside another
+    // function. `got` points at the live target, so read it before anything else can rewrite it.
+    const unsigned char* want   = nullptr;
+    const unsigned char* got    = nullptr;
+    unsigned             nbytes = 0;
+    const char*          what   = nullptr;   // the site's name, from its registration
 };
 
 inline void (*&HookInstallFailureSink())(const HookInstallFailure&) {
@@ -97,8 +105,13 @@ inline void (*&HookInstallFailureSink())(const HookInstallFailure&) {
     return sink;
 }
 
+// [PC-fork #166] Not a safetyhook error — safetyhook never runs for this one. Deliberately far above
+// any enumerator so it can never collide with a future safetyhook error type.
+inline constexpr unsigned kHookErrPrologueMismatch = 0xF001;
+
 // Names match safetyhook's InlineHook::Error / MidHook::Error enumerators, in declaration order.
 inline const char* HookInstallErrorName(unsigned t) {
+    if (t == kHookErrPrologueMismatch) return "PROLOGUE_MISMATCH";
     static const char* kNames[] = {
         "BAD_ALLOCATION", "FAILED_TO_DECODE_INSTRUCTION", "SHORT_JUMP_IN_TRAMPOLINE",
         "IP_RELATIVE_INSTRUCTION_OUT_OF_RANGE", "UNSUPPORTED_INSTRUCTION_IN_TRAMPOLINE",
@@ -113,6 +126,118 @@ inline void ReportHookInstallFailure(uintptr_t addr, const char* kind, unsigned 
     if (auto sink = HookInstallFailureSink())
         sink(HookInstallFailure{ addr, kind, errorType, slot,
                                  loc.file_name(), loc.line(), loc.function_name() });
+}
+
+// ============================================================================
+//  [PC-fork #166] EXPECTED-PROLOGUE GUARD — installing is not the same as installing in the RIGHT PLACE.
+//
+//  #7 (above) closed "the detour was never written". pc/HookSiteWitness.hpp closed it again from the
+//  caller's side by proving the entry bytes CHANGED. Neither says anything about WHICH bytes changed,
+//  and that is the hole:
+//
+//      QoH99 has two builds. Code above 0x4736C0 sits 0x20 higher in the December build; data does not
+//      move. Point a November address at a December image and the hook lands 0x20 short — inside the
+//      previous function, or partway into an instruction. safetyhook decodes whatever is there, writes
+//      a perfectly good detour, returns a live hook, and the witness confirms the bytes changed.
+//      Seven qoh99 sites did exactly this and EVERY existing check passed.
+//
+//  The asymmetry is the defect, and it is worth naming precisely: static byte patches have carried a
+//  guard for a long time (pc/BytePatchTable.hpp PatchSite::expect — "write only if the site currently
+//  holds these"), and that guard is the reason a byte patch cannot land on the wrong build. Hooks had
+//  no equivalent. Same hazard, same fix, and it belongs HERE rather than at the ~110 call sites for the
+//  same reason #164's retry does: it is one property of "install a hook", every adapter depends on it,
+//  and #108 already proved a per-site convention does not hold.
+//
+//  Shape: an adapter REGISTERS the bytes it expects at a target before installing; the two chokepoints
+//  (CreateInlineChecked for all three inline flavours, ManagedMidHook's ctor for mid) refuse to install
+//  when they do not match, and report through the same sink as every other install failure — carrying
+//  the wanted and found bytes, which is the entire diagnosis.
+//
+//  OPT-IN, and honestly so. A site with no registration installs exactly as before; the guard cannot
+//  retrofit knowledge nobody wrote down. What it must not do is let that look like coverage, so the
+//  registry counts guarded vs unguarded installs and HookSitePrologueStats() reports both — an adapter
+//  logging "12 hooks, 5 guarded" states the gap instead of implying there isn't one.
+//
+//  Storage is a fixed-capacity POD array, no allocation and no dynamic initializer, because this header
+//  is included at suspended-boot time from DllMain (same constraint as the failure sink).
+// ============================================================================
+struct HookSitePrologue {
+    uintptr_t     addr;        // absolute target VA (base already added — see RegisterHookSitePrologueRva)
+    const char*   what;        // the site's name, for the refusal line
+    unsigned      n;
+    unsigned char bytes[24];   // longest useful prologue; a real one is 5-8
+};
+
+struct HookSitePrologueRegistry {
+    static constexpr unsigned kMax = 64;
+    HookSitePrologue sites[kMax];
+    unsigned         count;
+    unsigned         dropped;            // registrations refused (table full / byte list too long)
+    unsigned         guardedInstalls;    // installs that were checked against a registration
+    unsigned         unguardedInstalls;  // installs with no registration — the honest coverage gap
+    unsigned         refusedInstalls;    // installs STOPPED by a mismatch
+};
+
+inline HookSitePrologueRegistry& HookSitePrologues() {
+    static HookSitePrologueRegistry r{};   // POD aggregate, constant-initialized: lands in .bss
+    return r;
+}
+
+inline const HookSitePrologueRegistry& HookSitePrologueStats() { return HookSitePrologues(); }
+
+// Declare the bytes that MUST be at `addr` for a hook there to be the hook we meant. Returns false if
+// the registration itself could not be stored — which the caller must treat as a failure to guard, not
+// as a guard that passed.
+inline bool RegisterHookSitePrologue(uintptr_t addr, const unsigned char* bytes, unsigned n,
+                                     const char* what) {
+    auto& reg = HookSitePrologues();
+    if (addr == 0 || bytes == nullptr || n == 0 ||
+        n > sizeof(HookSitePrologue::bytes) || reg.count >= HookSitePrologueRegistry::kMax) {
+        ++reg.dropped;
+        return false;
+    }
+    HookSitePrologue& s = reg.sites[reg.count++];
+    s.addr = addr;
+    s.what = what;
+    s.n    = n;
+    for (unsigned i = 0; i < n; ++i) s.bytes[i] = bytes[i];
+    return true;
+}
+
+inline const HookSitePrologue* FindHookSitePrologue(uintptr_t addr) {
+    const auto& reg = HookSitePrologues();
+    for (unsigned i = 0; i < reg.count; ++i)
+        if (reg.sites[i].addr == addr) return &reg.sites[i];
+    return nullptr;
+}
+
+// The gate. TRUE means "no objection, go ahead and install".
+//
+// addr == 0 returns true DELIBERATELY: that is #110's case (an address global that was never resolved),
+// and the existing FAILED_TO_DECODE report already names it correctly. Dereferencing zero here would
+// replace a good diagnosis with an access violation.
+//
+// The compare reads the target's bytes directly. That can only fault where safetyhook's own decode
+// would fault a moment later on the same address, so it introduces no hazard that was not already there.
+inline bool HookSitePrologueOk(uintptr_t addr, const char* kind, const void* slot,
+                               const std::source_location& loc = std::source_location::current()) {
+    auto& reg = HookSitePrologues();
+    if (addr == 0) return true;
+    const HookSitePrologue* s = FindHookSitePrologue(addr);
+    if (s == nullptr) { ++reg.unguardedInstalls; return true; }
+
+    const auto* live = reinterpret_cast<const unsigned char*>(addr);
+    for (unsigned i = 0; i < s->n; ++i) {
+        if (live[i] == s->bytes[i]) continue;
+        ++reg.refusedInstalls;
+        if (auto sink = HookInstallFailureSink())
+            sink(HookInstallFailure{ addr, kind, kHookErrPrologueMismatch, slot,
+                                     loc.file_name(), loc.line(), loc.function_name(),
+                                     s->bytes, live, s->n, s->what });
+        return false;
+    }
+    ++reg.guardedInstalls;
+    return true;
 }
 
 // Create an inline detour and REPORT failure instead of swallowing it. Returns an empty hook on
@@ -146,6 +271,10 @@ inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char
     // 8 attempts with a yield between them. Sized from the measurement, not taste: at a ~3% single-attempt
     // loss the chance of losing 8 independent draws is ~1e-12, while the cost when the first attempt
     // succeeds (the overwhelming case) is exactly zero.
+    // [PC-fork #166] Refuse BEFORE anything is written. A hook at the wrong address is worse than no
+    // hook: no hook fails loudly at the first missing callback, a wrong one runs foreign code.
+    if (!HookSitePrologueOk(reinterpret_cast<uintptr_t>(target), kind, slot, loc)) return {};
+
     constexpr int kAttempts = 8;
     unsigned lastErr = 0;
     for (int attempt = 0; attempt < kAttempts; ++attempt) {
@@ -524,6 +653,10 @@ private:
     explicit ManagedMidHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
+        // [PC-fork #166] The mid path is the OTHER chokepoint — guard it here, not at the call sites.
+        // Leaving `Hook` empty is exactly the shape a failed create leaves behind, so installed()
+        // already reports this correctly and no downstream code needs to learn a new state.
+        if (!HookSitePrologueOk(*HookAddr, "mid", HookAddr, Loc)) return;
         // [PC-fork #7] expected-returning create + failure report; see CreateInlineChecked's header note.
         auto midResult = safetyhook::MidHook::create(reinterpret_cast<void*>(*HookAddr), [](SafetyHookContext& ctx)
         {
