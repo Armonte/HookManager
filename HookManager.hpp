@@ -106,6 +106,42 @@ inline void (*&HookInstallFailureSink())(const HookInstallFailure&) {
     return sink;
 }
 
+// [PC-fork #189] FAILURES REPORTED BEFORE THE SINK EXISTS WERE DROPPED ON THE FLOOR — INCLUDING THE ONE
+// FAILURE THIS WHOLE MECHANISM WAS BUILT FOR.
+//
+// #182 added a pending buffer so install failures that happen before a LOGGER is wired still reach the log.
+// It never fired, because it lives INSIDE the sink (HookEngine's onHookInstallFailure) and the sink itself
+// is installed later still, by Driver::initHookEngine(). ReportHookInstallFailure below simply returned
+// when the sink was null, so the earliest failures produced nothing anywhere — not the log, not even the
+// OutputDebugStringA that was supposed to make it "never silent" (that call is also inside the sink).
+//
+// MEASURED (2026-08-05, qoh99 4P): the boot-serialize hook at winMain failed to install on p3 at t=31.895s;
+// Driver::initHookEngine() had not run yet. The bootmap recorded detourWritten=0 and the page/free-block
+// dump, but the safetyhook ERROR TYPE — the one fact that separates a transient BAD_ALLOCATION (retrying is
+// right) from a structural error (retrying is pointless) — existed for microseconds inside
+// CreateInlineChecked and was then discarded. Two prior investigations wanted exactly that value.
+//
+// So buffer UPSTREAM of the sink, where the report is actually made. Copying the record by value is safe:
+// every pointer in it aims at storage that outlives the process's boot — string literals, the static
+// prologue-declaration registry, and the live target address.
+inline constexpr int kMaxSinklessFail = 8;
+inline int& SinklessFailCount() { static int n = 0; return n; }
+inline HookInstallFailure* SinklessFailBuf() { static HookInstallFailure buf[kMaxSinklessFail]; return buf; }
+
+inline void ReportOrBufferHookFailure(const HookInstallFailure& f) {
+    if (auto sink = HookInstallFailureSink()) { sink(f); return; }
+    if (SinklessFailCount() < kMaxSinklessFail) SinklessFailBuf()[SinklessFailCount()++] = f;
+}
+
+// Install the sink and immediately drain anything that failed before it existed. Use this rather than
+// assigning HookInstallFailureSink() directly — a bare assignment silently keeps the old drop behaviour.
+inline void SetHookInstallFailureSink(void (*sink)(const HookInstallFailure&)) {
+    HookInstallFailureSink() = sink;
+    if (!sink) return;
+    for (int i = 0; i < SinklessFailCount(); ++i) sink(SinklessFailBuf()[i]);
+    SinklessFailCount() = 0;
+}
+
 // [PC-fork #166] Not a safetyhook error — safetyhook never runs for this one. Deliberately far above
 // any enumerator so it can never collide with a future safetyhook error type.
 inline constexpr unsigned kHookErrPrologueMismatch = 0xF001;
@@ -124,9 +160,8 @@ inline const char* HookInstallErrorName(unsigned t) {
 inline void ReportHookInstallFailure(uintptr_t addr, const char* kind, unsigned errorType,
                                      const void* slot = nullptr,
                                      const std::source_location& loc = std::source_location::current()) {
-    if (auto sink = HookInstallFailureSink())
-        sink(HookInstallFailure{ addr, kind, errorType, slot,
-                                 loc.file_name(), loc.line(), loc.function_name() });
+    ReportOrBufferHookFailure(HookInstallFailure{ addr, kind, errorType, slot,
+                                                  loc.file_name(), loc.line(), loc.function_name() });
 }
 
 // ============================================================================
@@ -231,10 +266,9 @@ inline bool HookSitePrologueOk(uintptr_t addr, const char* kind, const void* slo
     for (unsigned i = 0; i < s->n; ++i) {
         if (live[i] == s->bytes[i]) continue;
         ++reg.refusedInstalls;
-        if (auto sink = HookInstallFailureSink())
-            sink(HookInstallFailure{ addr, kind, kHookErrPrologueMismatch, slot,
-                                     loc.file_name(), loc.line(), loc.function_name(),
-                                     s->bytes, live, s->n, s->what });
+        ReportOrBufferHookFailure(HookInstallFailure{ addr, kind, kHookErrPrologueMismatch, slot,
+                                                      loc.file_name(), loc.line(), loc.function_name(),
+                                                      s->bytes, live, s->n, s->what });
         return false;
     }
     ++reg.guardedInstalls;
