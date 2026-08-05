@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <source_location>
+#include <chrono>   // [#182] escalating retry backoff (see CreateInlineChecked)
 #include <thread>   // [PC-fork #7b] name the FAILING CALL SITE, not just the failing address
 
 
@@ -275,6 +276,17 @@ inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char
     // hook: no hook fails loudly at the first missing callback, a wrong one runs foreign code.
     if (!HookSitePrologueOk(reinterpret_cast<uintptr_t>(target), kind, slot, loc)) return {};
 
+    // [#182] THE RETRIES MUST BE SPREAD IN TIME, AND YIELD IS NOT TIME. The loop above used
+    // std::this_thread::yield() between attempts, and the sizing argument ("~3% single-attempt loss ->
+    // 1e-12 over 8 draws") silently assumes the draws are INDEPENDENT. They are not: yield() returns in
+    // microseconds, so all 8 attempts sample essentially one instant, while the contention that causes
+    // BAD_ALLOCATION is another process starting simultaneously — a window measured in MILLISECONDS.
+    // Eight samples of the same instant is one draw, not eight, which is why the measured failure rate
+    // never fell to anything like 1e-12: an 8-run 2-instance soak on 2026-08-04 lost TWO runs (25%) to
+    // this exact install, both leaving qoh99's device init unserialized and re-arming the #88 boot-park.
+    // Escalating sleeps (1,2,4,8,16,32,64ms; ~127ms worst case, and only on a path that is already
+    // failing) actually span the other process's startup. The common case — first attempt succeeds —
+    // still costs nothing.
     constexpr int kAttempts = 8;
     unsigned lastErr = 0;
     for (int attempt = 0; attempt < kAttempts; ++attempt) {
@@ -283,7 +295,8 @@ inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char
         lastErr = r.error().type;
         // Structural errors do not improve by waiting — fail fast and report the real reason.
         if (lastErr != safetyhook::InlineHook::Error::BAD_ALLOCATION) break;
-        std::this_thread::yield();
+        if (attempt + 1 < kAttempts)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1 << attempt));
     }
     ReportHookInstallFailure(reinterpret_cast<uintptr_t>(target), kind, lastErr, slot, loc);
     return {};
