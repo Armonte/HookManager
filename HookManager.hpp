@@ -146,6 +146,13 @@ inline void SetHookInstallFailureSink(void (*sink)(const HookInstallFailure&)) {
 // any enumerator so it can never collide with a future safetyhook error type.
 inline constexpr unsigned kHookErrPrologueMismatch = 0xF001;
 
+// [#217] BAD_ALLOCATION is safetyhook's FIRST enumerator, so its value is 0 — which is also what an
+// uninitialised errorType holds. Named here so callers that need to branch on it (HookEngine's #217
+// arena report) do not hardcode a literal, and so this hazard is written down once: if you ever see
+// BAD_ALLOCATION on a path that did not come from safetyhook, suspect a default-constructed failure
+// record rather than a real allocator error.
+inline constexpr unsigned kHookErrBadAllocation = 0;
+
 // Names match safetyhook's InlineHook::Error / MidHook::Error enumerators, in declaration order.
 inline const char* HookInstallErrorName(unsigned t) {
     if (t == kHookErrPrologueMismatch) return "PROLOGUE_MISMATCH";
@@ -300,6 +307,81 @@ inline bool HookSitePrologueOk(uintptr_t addr, const char* kind, const void* slo
 // hook", every adapter depends on it, and #108 already proved that a per-site convention does not hold.
 // The retry count is REPORTED on final failure so a genuinely exhausted address space still looks
 // different from a one-off contention loss.
+// [PC-fork #217] THE TRAMPOLINE ARENA — why the retry above was necessary but not sufficient.
+//
+// The comment above says BAD_ALLOCATION "means no memory right now ... the pressure comes from other
+// processes starting at the same moment", and treats a spread-in-time retry as the cure. Measured
+// 2026-08-10, that is WRONG about this failure: in a 4P soak a losing instance reported BAD_ALLOCATION
+// for SIX inline sites across FOUR different pages at the SAME millisecond, and all 8 escalating
+// attempts lost. A failure that takes every site in the process at one instant, and does not recover
+// over 127ms, is not another process holding a resource — it is this process being unable to obtain a
+// 64KB RWX block near the target AT ALL for that stretch. Sleeping does not create address space.
+//
+// Both facts matter and neither replaces the other: the retry still covers genuine transient contention,
+// and the arena covers this. Keeping both is deliberate.
+//
+// HOW THE ARENA REMOVES IT: safetyhook's Allocator::internal_allocate_near searches the freelists of
+// blocks it ALREADY owns before it ever calls VirtualAlloc, and ~Allocation returns memory to that
+// freelist. So one block reserved ONCE, early — at DLL attach, before SDL3/D3D11/ImGui and the game's
+// own allocations have fragmented the 32-bit address space — serves every later trampoline from a
+// freelist with no VirtualAlloc on the hot path. After reserveTrampolineArena() succeeds,
+// BAD_ALLOCATION is structurally unreachable for any hook that fits in the arena.
+//
+// x86 note: an inline detour is a 5-byte rel32 JMP, so "near" is ±2GB — the whole user address space.
+// The arena does not need to be adjacent to anything; it only needs to EXIST before the space is carved
+// up. That is the entire trick.
+// Bytes the arena reserved, 0 if the reservation failed. Written exactly once, by the static init below.
+inline constexpr size_t kTrampolineArenaBytes = 1024 * 1024;
+inline size_t& TrampolineArenaBytes() { static size_t n = 0; return n; }
+
+// THE RESERVATION HAPPENS ON FIRST USE, INSIDE THIS STATIC INIT, AND THAT PLACEMENT IS THE WHOLE POINT.
+// It was first written as an explicit call from HookEngine::init() — which is WRONG and was caught by
+// the soak: HookEngine.cpp says in its own comment that "the adapter's earliest boot hooks install
+// before Driver::initHookEngine()", so an arena reserved there arrives AFTER the exact installs that
+// were failing. Measured: hooks failed at 06:48:07-09 in a run whose arena was reserved later still.
+//
+// First-use init cannot be misplaced. The first caller IS the first hook creation, whenever and wherever
+// that happens — DLL attach for qoh99's boot-serialize hook, later for a lazily-installed one — so the
+// arena is always reserved immediately before the first trampoline is needed, which is also the moment
+// the address space is least fragmented. Do not "improve" this by hoisting it to an explicit init call;
+// that is the version that did not work.
+inline std::shared_ptr<safetyhook::Allocator>& TrampolineAllocator() {
+    static std::shared_ptr<safetyhook::Allocator> a = [] {
+        auto p = safetyhook::Allocator::create();
+        // Allocate and immediately drop: ~Allocation hands the whole span to the block's freelist, which
+        // is exactly the state we want — owned, committed RWX, reusable with no further VirtualAlloc.
+        if (auto r = p->allocate(kTrampolineArenaBytes)) TrampolineArenaBytes() = kTrampolineArenaBytes;
+        return p;
+    }();
+    return a;
+}
+
+// SIZED FOR THE FLEET, NOT FOR ONE ADAPTER. A too-small arena fails as BAD_ALLOCATION — the SAME error
+// this exists to eliminate — which would be the worst possible way for it to break, because the symptom
+// would be indistinguishable from the bug. Only one game adapter is live per process, but pchost also
+// installs video/overlay/input hooks, adapters keep gaining sites (mbaacc added two mid hooks on
+// 2026-08-10), and a mid hook costs a stub AND a trampoline. ~110 sites at a few hundred bytes each is
+// tens of KB; 1 MB is ~10x that and is committed once in a 2 GB address space. Cheap insurance against
+// the failure mode being resurrected by a future adapter, which is worth more than the megabyte.
+//
+// If it ever DOES exhaust, the failure reporter says so in those words rather than repeating the raw
+// BAD_ALLOCATION — see HookEngine.cpp's onHookInstallFailure.
+//
+// x86 assumption, stated because it is load-bearing: a rel32 detour reaches ±2GB, which is the whole
+// 32-bit user address space, so the arena is in range of every target no matter where it lands. On a
+// 64-bit target that stops being true and the arena would have to be placed near the image instead.
+//
+// Force the arena (idempotent) and report what it got. Safe to call at any time; the reservation itself
+// already happened at first use. Returns bytes reserved, 0 if the reservation failed — and failure is
+// not fatal: creates fall back to allocate-on-demand, i.e. exactly the pre-#217 behaviour, so this is a
+// hardening and never a dependency. It is NOT a silent fallback though: HookEngine reports which of the
+// two states the process is in on EVERY run, because a hardening whose absence is invisible is the exact
+// shape that caused all of this.
+inline size_t reserveTrampolineArena() {
+    (void)TrampolineAllocator();   // forces the static init above if it has not run yet
+    return TrampolineArenaBytes();
+}
+
 inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char* kind,
                                             const void* slot = nullptr,
                                             const std::source_location& loc = std::source_location::current()) {
@@ -324,7 +406,10 @@ inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char
     constexpr int kAttempts = 8;
     unsigned lastErr = 0;
     for (int attempt = 0; attempt < kAttempts; ++attempt) {
-        auto r = safetyhook::InlineHook::create(target, dest);
+        // [#217] The ALLOCATOR overload, not the two-arg one. The two-arg form uses Allocator::global()
+        // and reaches for a fresh 64KB RWX block per hook; this one draws from the arena reserved at
+        // init, so after a successful reserveTrampolineArena() no VirtualAlloc happens here at all.
+        auto r = safetyhook::InlineHook::create(TrampolineAllocator(), target, dest);
         if (r) return std::move(*r);
         lastErr = r.error().type;
         // Structural errors do not improve by waiting — fail fast and report the real reason.
@@ -705,7 +790,10 @@ private:
         // already reports this correctly and no downstream code needs to learn a new state.
         if (!HookSitePrologueOk(*HookAddr, "mid", HookAddr, Loc)) return;
         // [PC-fork #7] expected-returning create + failure report; see CreateInlineChecked's header note.
-        auto midResult = safetyhook::MidHook::create(reinterpret_cast<void*>(*HookAddr), [](SafetyHookContext& ctx)
+        // [#217] Arena allocator here too — a mid hook allocates a stub AND a trampoline, so it is
+        // strictly more exposed to BAD_ALLOCATION than the inline path that first exhibited it.
+        auto midResult = safetyhook::MidHook::create(TrampolineAllocator(),
+            reinterpret_cast<void*>(*HookAddr), [](SafetyHookContext& ctx)
         {
             // [PC-fork #2] mid dispatcher must look up the MidHooks vector, not Hooks.
             auto Hook = static_cast<ManagedMidHook*>(HookManager::GetInstance()->GetMidHook(*HookAddr));
