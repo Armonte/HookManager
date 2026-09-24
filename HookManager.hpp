@@ -539,11 +539,15 @@ private:
 
     uintptr_t GetAddr() const { return Addr; }
 
+    // [PC-fork, 2026-09-23] Per-class self pointer, set BEFORE the detour exists -- see ManagedMidHook::s_self. The
+    // shared-vector lookup raced AddHook's push_back and threw (std::terminate) on a hit in the install window.
+    static inline ManagedHook* s_self = nullptr;
+
     // Convention-agnostic body: pre-chain -> original (via the CC-matched trampoline) -> post-chain.
     static T ExecuteImpl(Args... InArgs)
     {
-        auto Self = static_cast<ManagedHook*>(HookManager::GetInstance()->GetHook(*HookAddr));
-        if (Self == nullptr) throw std::runtime_error("Hook not found! This should never happen.");
+        auto Self = s_self;
+        if (Self == nullptr) return T();   // cannot happen (set before create); never terminate the game over it
 
         T ReturnValue = T();
         bool bSkipOriginal = false;
@@ -600,6 +604,7 @@ private:
     explicit ManagedHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
+        s_self = this;
         Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
                                    HookAddr, Loc);
     }
@@ -630,33 +635,43 @@ private:
 
     uintptr_t GetAddr() const { return Addr; }
 
-    static void ExecuteImpl(Args... InArgs)
+    static inline ManagedHook* s_self = nullptr;   // [PC-fork, 2026-09-23] see the non-void ManagedHook::s_self
+
+    // [PC-fork, 2026-09-23] A "void" function still hands its caller EAX, and game code does read it: MEASURED on GD
+    // nyunyu, a caller stored EAX after CRT free() into fighter +0x290 -- with the arena's free() hook replacing the
+    // original, EAX was whatever this dispatcher left (a pointer to our own hook object, a different heap address in
+    // each process), and two netplay peers desynced on it. So the thunk returns a register-sized value: the
+    // original's own EAX when it runs, and a fixed 1 when a pre-callback replaced it (native free() leaves HeapFree's
+    // TRUE on its heap path). The game sees exactly what it would natively, or the same constant on every peer.
+    static uintptr_t ExecuteImpl(Args... InArgs)
     {
-        auto Self = static_cast<ManagedHook*>(HookManager::GetInstance()->GetHook(*HookAddr));
-        if (Self == nullptr) throw std::runtime_error("Hook not found! This should never happen.");
+        auto Self = s_self;
+        if (Self == nullptr) return 0;
 
         bool bSkipOriginal = false;
         for (auto& PreCallback : Self->PreCallbacks)
         {
             if (PreCallback(InArgs...)) bSkipOriginal = true;
         }
+        uintptr_t Eax = 1;
         if (!bSkipOriginal)
         {
-            if constexpr (CC == CallConv::Stdcall)       Self->Hook.unsafe_stdcall(InArgs...);
-            else if constexpr (CC == CallConv::Thiscall) Self->Hook.unsafe_thiscall(InArgs...);
-            else if constexpr (CC == CallConv::Fastcall) Self->Hook.unsafe_fastcall(InArgs...);
-            else                                         Self->Hook.unsafe_call(InArgs...);
+            if constexpr (CC == CallConv::Stdcall)       Eax = Self->Hook.template unsafe_stdcall<uintptr_t>(InArgs...);
+            else if constexpr (CC == CallConv::Thiscall) Eax = Self->Hook.template unsafe_thiscall<uintptr_t>(InArgs...);
+            else if constexpr (CC == CallConv::Fastcall) Eax = Self->Hook.template unsafe_fastcall<uintptr_t>(InArgs...);
+            else                                         Eax = Self->Hook.template unsafe_call<uintptr_t>(InArgs...);
         }
         for (auto& PostCallback : Self->PostCallbacks)
         {
             PostCallback(InArgs...);
         }
+        return Eax;
     }
 
-    template <bool = true> static void SAFETYHOOK_CCALL     Execute_cdecl(Args... a)    { ExecuteImpl(a...); }
-    template <bool = true> static void SAFETYHOOK_STDCALL  Execute_stdcall(Args... a)  { ExecuteImpl(a...); }
-    template <bool = true> static void SAFETYHOOK_THISCALL Execute_thiscall(Args... a) { ExecuteImpl(a...); }
-    template <bool = true> static void SAFETYHOOK_FASTCALL Execute_fastcall(Args... a) { ExecuteImpl(a...); }
+    template <bool = true> static uintptr_t SAFETYHOOK_CCALL     Execute_cdecl(Args... a)    { return ExecuteImpl(a...); }
+    template <bool = true> static uintptr_t SAFETYHOOK_STDCALL  Execute_stdcall(Args... a)  { return ExecuteImpl(a...); }
+    template <bool = true> static uintptr_t SAFETYHOOK_THISCALL Execute_thiscall(Args... a) { return ExecuteImpl(a...); }
+    template <bool = true> static uintptr_t SAFETYHOOK_FASTCALL Execute_fastcall(Args... a) { return ExecuteImpl(a...); }
 
     static void* EntryThunk()
     {
@@ -669,6 +684,7 @@ private:
     explicit ManagedHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
+        s_self = this;
         Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
                                    HookAddr, Loc);
     }
@@ -782,9 +798,18 @@ private:
 
     uintptr_t GetAddr() const { return Addr; }
 
+    // [PC-fork, 2026-09-23] THE DISPATCHER FINDS ITS HOOK THROUGH THIS, NOT THROUGH THE SHARED VECTOR. The detour goes live
+    // inside MidHook::create below, but AddMidHook registers the object in HookManager::MidHooks only AFTER this ctor
+    // returns -- so a game thread reaching the site in that window found nothing and threw ("MidHook not found! This
+    // should never happen."), i.e. std::terminate. MEASURED 09-23 on a heavily loaded box (GD yata1 loopback, one peer
+    // died at init). Scanning MidHooks from the game thread also raced AddMidHook's push_back (a reallocation mid-scan).
+    // Each ManagedMidHook<HookAddr> is its own class, so a per-class pointer set BEFORE the detour exists closes both.
+    static inline ManagedMidHook* s_self = nullptr;
+
     explicit ManagedMidHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
+        s_self = this;
         // [PC-fork #166] The mid path is the OTHER chokepoint — guard it here, not at the call sites.
         // Leaving `Hook` empty is exactly the shape a failed create leaves behind, so installed()
         // already reports this correctly and no downstream code needs to learn a new state.
@@ -795,9 +820,9 @@ private:
         auto midResult = safetyhook::MidHook::create(TrampolineAllocator(),
             reinterpret_cast<void*>(*HookAddr), [](SafetyHookContext& ctx)
         {
-            // [PC-fork #2] mid dispatcher must look up the MidHooks vector, not Hooks.
-            auto Hook = static_cast<ManagedMidHook*>(HookManager::GetInstance()->GetMidHook(*HookAddr));
-            if (Hook == nullptr) throw std::runtime_error("MidHook not found! This should never happen.");
+            // [PC-fork #2] superseded by s_self (see above): no lookup, so nothing to miss and nothing to race.
+            auto Hook = s_self;
+            if (Hook == nullptr) return;   // cannot happen (set before create); never terminate the game over it
 
             for (auto& Callback : Hook->Callbacks)
             {
