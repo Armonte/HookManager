@@ -145,6 +145,10 @@ inline void SetHookInstallFailureSink(void (*sink)(const HookInstallFailure&)) {
 // [PC-fork #166] Not a safetyhook error — safetyhook never runs for this one. Deliberately far above
 // any enumerator so it can never collide with a future safetyhook error type.
 inline constexpr unsigned kHookErrPrologueMismatch = 0xF001;
+// [PC-fork, 2026-09-23] Not a safetyhook error either: a SECOND hook object for a slot whose hook class already has a
+// live instance. The dispatchers find their hook through a per-class s_self (one object per template instantiation);
+// a second object would silently repoint the first hook's thunk, so it is refused and reported instead.
+inline constexpr unsigned kHookErrDuplicateInstance = 0xF002;
 
 // [#217] BAD_ALLOCATION is safetyhook's FIRST enumerator, so its value is 0 — which is also what an
 // uninitialised errorType holds. Named here so callers that need to branch on it (HookEngine's #217
@@ -156,6 +160,7 @@ inline constexpr unsigned kHookErrBadAllocation = 0;
 // Names match safetyhook's InlineHook::Error / MidHook::Error enumerators, in declaration order.
 inline const char* HookInstallErrorName(unsigned t) {
     if (t == kHookErrPrologueMismatch) return "PROLOGUE_MISMATCH";
+    if (t == kHookErrDuplicateInstance) return "DUPLICATE_INSTANCE";
     static const char* kNames[] = {
         "BAD_ALLOCATION", "FAILED_TO_DECODE_INSTRUCTION", "SHORT_JUMP_IN_TRAMPOLINE",
         "IP_RELATIVE_INSTRUCTION_OUT_OF_RANGE", "UNSUPPORTED_INSTRUCTION_IN_TRAMPOLINE",
@@ -604,10 +609,16 @@ private:
     explicit ManagedHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
+        // ONE OBJECT PER INSTANTIATION, said out loud: a second one would repoint the live hook's thunk. Refused (the
+        // hook stays empty, installed() is false) and reported through the install-failure sink.
+        if (s_self != nullptr) { ReportHookInstallFailure(*HookAddr, "inline", kHookErrDuplicateInstance, HookAddr, Loc); return; }
         s_self = this;
         Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
                                    HookAddr, Loc);
     }
+public:
+    // UNHOOK FIRST, THEN FORGET: a re-install must never find a thunk that calls through a dead object.
+    ~ManagedHook() { Hook = {}; if (s_self == this) s_self = nullptr; }
 
 public:
     // [PC-fork #7] TRUE iff the detour actually took. `this != nullptr` never was evidence of that.
@@ -643,6 +654,8 @@ private:
     // each process), and two netplay peers desynced on it. So the thunk returns a register-sized value: the
     // original's own EAX when it runs, and a fixed 1 when a pre-callback replaced it (native free() leaves HeapFree's
     // TRUE on its heap path). The game sees exactly what it would natively, or the same constant on every peer.
+    // THE 1 IS A DETERMINISM CONSTANT, NOT A RESULT: a caller of a void-declared function must not act on EAX after a
+    // SKIPPED call -- the value only has to be identical on every peer and every re-sim, which a leaked pointer is not.
     static uintptr_t ExecuteImpl(Args... InArgs)
     {
         auto Self = s_self;
@@ -684,10 +697,16 @@ private:
     explicit ManagedHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
+        // ONE OBJECT PER INSTANTIATION, said out loud: a second one would repoint the live hook's thunk. Refused (the
+        // hook stays empty, installed() is false) and reported through the install-failure sink.
+        if (s_self != nullptr) { ReportHookInstallFailure(*HookAddr, "inline", kHookErrDuplicateInstance, HookAddr, Loc); return; }
         s_self = this;
         Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
                                    HookAddr, Loc);
     }
+public:
+    // UNHOOK FIRST, THEN FORGET: a re-install must never find a thunk that calls through a dead object.
+    ~ManagedHook() { Hook = {}; if (s_self == this) s_self = nullptr; }
 
 public:
     // [PC-fork #7] TRUE iff the detour actually took. A non-null handle never was evidence of that.
@@ -809,6 +828,7 @@ private:
     explicit ManagedMidHook(const std::source_location& Loc = std::source_location::current())
     {
         Addr = *HookAddr;
+        if (s_self != nullptr) { ReportHookInstallFailure(*HookAddr, "mid", kHookErrDuplicateInstance, HookAddr, Loc); return; }
         s_self = this;
         // [PC-fork #166] The mid path is the OTHER chokepoint — guard it here, not at the call sites.
         // Leaving `Hook` empty is exactly the shape a failed create leaves behind, so installed()
@@ -832,6 +852,9 @@ private:
         if (midResult) Hook = std::move(*midResult);
         else ReportHookInstallFailure(*HookAddr, "mid", midResult.error().type, HookAddr, Loc);
     }
+public:
+    ~ManagedMidHook() { Hook = {}; if (s_self == this) s_self = nullptr; }   // unhook first, then forget
+private:
 
 public:
     // [PC-fork #7] TRUE iff the detour actually took. A non-null handle never was evidence of that.
