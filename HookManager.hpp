@@ -414,7 +414,10 @@ inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char
         // [#217] The ALLOCATOR overload, not the two-arg one. The two-arg form uses Allocator::global()
         // and reaches for a fresh 64KB RWX block per hook; this one draws from the arena reserved at
         // init, so after a successful reserveTrampolineArena() no VirtualAlloc happens here at all.
-        auto r = safetyhook::InlineHook::create(TrampolineAllocator(), target, dest);
+        // [#385] StartDisabled: the target is NOT redirected here. See InstallInlineChecked — the redirect lands
+        // only after the hook object is in its final home, where the entry thunk reads the trampoline from.
+        auto r = safetyhook::InlineHook::create(TrampolineAllocator(), target, dest,
+                                                safetyhook::InlineHook::StartDisabled);
         if (r) return std::move(*r);
         lastErr = r.error().type;
         // Structural errors do not improve by waiting — fail fast and report the real reason.
@@ -424,6 +427,26 @@ inline SafetyHookInline CreateInlineChecked(void* target, void* dest, const char
     }
     ReportHookInstallFailure(reinterpret_cast<uintptr_t>(target), kind, lastErr, slot, loc);
     return {};
+}
+
+// [#385, 2026-09-25] BUILD DISABLED, MOVE HOME, THEN REDIRECT. `Hook = create_inline(...)` redirected the target
+// INSIDE create and move-assigned the result afterwards, so for that window the live detour's entry thunk read an
+// EMPTY Hook member: a game thread calling the target then ran unsafe_call through a null trampoline — an AV at
+// address 0 (ECX=0, EBP=0). Measured ~1 in 15 yata2 viewer launches, 2 ms after "frame driver hook @0x483610
+// installed": the late install runs with the game thread live, so the window is real. The s_self-before-create
+// fix (2026-09-23) closed the SELF half of this race; this closes the TRAMPOLINE half. Every inline flavour installs
+// through here; an enable failure is reported like any other install failure and leaves `into` empty.
+inline bool InstallInlineChecked(SafetyHookInline& into, void* target, void* dest, const char* kind,
+                                 const void* slot = nullptr,
+                                 const std::source_location& loc = std::source_location::current()) {
+    into = CreateInlineChecked(target, dest, kind, slot, loc);
+    if (!into) return false;
+    if (auto e = into.enable(); !e) {
+        ReportHookInstallFailure(reinterpret_cast<uintptr_t>(target), kind, e.error().type, slot, loc);
+        into = {};
+        return false;
+    }
+    return true;
 }
 
 // [PC-fork #5] Calling convention of the hooked function's ABI (x86).
@@ -613,8 +636,7 @@ private:
         // hook stays empty, installed() is false) and reported through the install-failure sink.
         if (s_self != nullptr) { ReportHookInstallFailure(*HookAddr, "inline", kHookErrDuplicateInstance, HookAddr, Loc); return; }
         s_self = this;
-        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
-                                   HookAddr, Loc);
+        InstallInlineChecked(Hook, reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline", HookAddr, Loc);
     }
 public:
     // UNHOOK FIRST, THEN FORGET: a re-install must never find a thunk that calls through a dead object.
@@ -701,8 +723,7 @@ private:
         // hook stays empty, installed() is false) and reported through the install-failure sink.
         if (s_self != nullptr) { ReportHookInstallFailure(*HookAddr, "inline", kHookErrDuplicateInstance, HookAddr, Loc); return; }
         s_self = this;
-        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
-                                   HookAddr, Loc);
+        InstallInlineChecked(Hook, reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline", HookAddr, Loc);
     }
 public:
     // UNHOOK FIRST, THEN FORGET: a re-install must never find a thunk that calls through a dead object.
@@ -778,8 +799,7 @@ private:
     // registry, so a frame firing the instant the redirect lands finds Self != null (see ExecuteImpl).
     void Install()
     {
-        Hook = CreateInlineChecked(reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline",
-                                   HookAddr, Loc);
+        InstallInlineChecked(Hook, reinterpret_cast<void*>(*HookAddr), EntryThunk(), "inline", HookAddr, Loc);
     }
 
 public:
