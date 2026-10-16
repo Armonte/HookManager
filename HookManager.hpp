@@ -222,7 +222,7 @@ private:
         Addr = *HookAddr;
         Hook = safetyhook::create_mid(reinterpret_cast<void*>(*HookAddr), [](SafetyHookContext& ctx)
         {
-            auto Hook = static_cast<ManagedMidHook*>(HookManager::GetInstance()->GetHook(*HookAddr));
+            auto Hook = static_cast<ManagedMidHook*>(HookManager::GetInstance()->GetMidHook(*HookAddr));
             if (Hook == nullptr) throw std::runtime_error("Hook not found! This should never happen.");
             
             for (auto& Callback : Hook->Callbacks)
