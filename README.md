@@ -1,6 +1,17 @@
 # HookManager
 A hook manager using SafetyHook. By exposing the HookManager in a DLL, dependent users can hook functions even if another hook has been placed. All placed hooks will execute.
 
+> **This is the PovertyCaster fork** (Armonte/HookManager) of [WistfulHopes/HookManager](https://github.com/WistfulHopes/HookManager),
+> shared by PovertyCaster and ccrollback. It builds for 32-bit `i686-w64-mingw32` (GCC 13, C++23) as well as the upstream targets, and adds
+> an x86 calling-convention selector (`AddHookCC`), `ManagedDriverHook` (a detour that runs the original 0..N times: rollback
+> re-simulation, fast-forward), install-failure reporting, a target-bytes guard, retry of transient trampoline allocation failures,
+> and disabled-then-enabled inline installs. Every change is tagged `[PC-fork #N]` in the source; `UPSTREAM.md` explains each one
+> and which are upstreamable as-is.
+>
+> **Using it:** `add_subdirectory(HookManager)` then link `HookManager::HookManager`. It links an existing SafetyHook target
+> (`HOOKMANAGER_SAFETYHOOK_TARGET`, or a target named `safetyhook`), else fetches upstream
+> [cursey/safetyhook](https://github.com/cursey/safetyhook) at the pinned `HOOKMANAGER_SAFETYHOOK_TAG`. See `CMakeLists.txt`.
+
 ## Usage
 There are two types of hooks exposed by HookManager: `ManagedHook` for inline hooks, and `ManagedMidHook` for mid-function hooks.
 
