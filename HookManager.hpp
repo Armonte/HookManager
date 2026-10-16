@@ -240,6 +240,6 @@ public:
 
     void RemoveCallback(void(*Callback)(SafetyHookContext&))
     {
-        Callbacks.push_back(Callback);
+        std::erase(Callbacks, Callback);
     }
 };
