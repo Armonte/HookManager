@@ -121,7 +121,7 @@ public:
         }
         if (!bSkipOriginal)
         {
-            ReturnValue = Hook->Hook.unsafe_call<T>(InArgs...);
+            ReturnValue = Hook->Hook.template unsafe_call<T>(InArgs...);
         }
         for (auto& PostCallback : Hook->PostCallbacks)
         {
