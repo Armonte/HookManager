@@ -125,10 +125,10 @@ public:
         }
         for (auto& PostCallback : Hook->PostCallbacks)
         {
-            T Temp = T();
-            if (PostCallback(Temp, InArgs...))
+            T Candidate = ReturnValue;
+            if (PostCallback(Candidate, InArgs...))
             {
-                ReturnValue = Temp;
+                ReturnValue = Candidate;
             }
         }
         return ReturnValue;
